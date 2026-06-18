@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv_*/
+.venv/
+env/
+
+# Outputs (large binary arrays and results — too big for git)
+outputs/
+outputs_*/
+
+# Data (not to be committed — external drive or cluster)
+data/things_images/
+data/**/*.npy
+data/**/*.h5
+
+# Configs with temp/scratch entries (keep clean configs only)
+configs/tmp_*.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# MacOS
+.DS_Store
+
+# Cluster SSH keys (never commit)
+../cluster/id_*
+
+# Docs build artefacts
+docs/_build/

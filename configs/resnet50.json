@@ -1,0 +1,50 @@
+{
+  "experiment_name": "resnet50_things",
+  "model": {
+    "name": "resnet50",
+    "pretrained": true,
+    "allow_untrained_fallback": false,
+    "layers": ["conv1", "layer1", "layer2", "layer3", "layer4", "fc"],
+    "conv_pooling": "global_average"
+  },
+  "data": {
+    "stimuli_csv": "data/stimuli_subset.csv",
+    "image_id_column": "image_id",
+    "concept_column": "concept",
+    "category_column": "category",
+    "image_path_column": "image_path"
+  },
+  "features": {
+    "output_dir": "outputs/features",
+    "batch_size": 32
+  },
+  "geometry": {
+    "metric": "cosine",
+    "output_dir": "outputs/geometry"
+  },
+  "dimensionality": {
+    "output_dir": "outputs/dimensionality",
+    "id_k_neighbors": 20,
+    "n_pca_subsample": 50
+  },
+  "human": {
+    "distance_matrix": "outputs/human/things_human_distance.npy",
+    "source": "things_similarity"
+  },
+  "wordnet": {
+    "similarity": "wup",
+    "output_dir": "outputs/human"
+  },
+  "tda": {
+    "modes": ["pca50", "pca10", "original"],
+    "homology_maxdim": 1,
+    "max_points": 300,
+    "output_dir": "outputs/tda"
+  },
+  "figures": {
+    "output_dir": "outputs/figures"
+  },
+  "results": {
+    "output_dir": "outputs/results"
+  }
+}

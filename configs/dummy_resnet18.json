@@ -1,0 +1,41 @@
+{
+  "experiment_name": "dummy_resnet18_subset",
+  "model": {
+    "name": "resnet18",
+    "pretrained": false,
+    "allow_untrained_fallback": true,
+    "layers": ["conv1", "layer1", "layer2", "layer3", "layer4", "fc"],
+    "conv_pooling": "global_average"
+  },
+  "data": {
+    "stimuli_csv": "data/stimuli_subset.csv",
+    "image_id_column": "image_id",
+    "concept_column": "concept",
+    "category_column": "category",
+    "image_path_column": "image_path"
+  },
+  "features": {
+    "output_dir": "outputs/features",
+    "batch_size": 16
+  },
+  "geometry": {
+    "metric": "cosine",
+    "output_dir": "outputs/geometry"
+  },
+  "human": {
+    "distance_matrix": "outputs/human/dummy_human_distance.npy",
+    "source": "dummy_concept_structure"
+  },
+  "tda": {
+    "modes": ["pca3", "pca10", "original"],
+    "homology_maxdim": 1,
+    "max_points": 72,
+    "output_dir": "outputs/tda"
+  },
+  "figures": {
+    "output_dir": "outputs/figures"
+  },
+  "results": {
+    "output_dir": "outputs/results"
+  }
+}
