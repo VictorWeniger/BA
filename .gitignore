@@ -22,6 +22,7 @@ outputs_*/
 data/things_images/
 data/**/*.npy
 data/**/*.h5
+data/surface_betas/
 
 # Configs with temp/scratch entries (keep clean configs only)
 configs/tmp_*.json

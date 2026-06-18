@@ -113,10 +113,11 @@ def hemi_meshes(fs_dir, hemi, orig):
 
 
 def project(vol_img, white, pial, interpolation="linear"):
-    """vol_to_surf zwischen white und pial (Mid-Thickness-Sampling)."""
+    """vol_to_surf: einzelner Probepunkt bei depth=0.5 (Santis Methode)."""
     tex = surface.vol_to_surf(vol_img, surf_mesh=pial, inner_mesh=white,
-                              interpolation=interpolation)
-    return tex  # (n_vert,) oder (n_vert, n)
+                              interpolation=interpolation,
+                              kind="depth", depth=[0.5])
+    return tex  # (n_vert,)
 
 
 # --------------------------------------------------------------------------- #
@@ -231,12 +232,13 @@ def main():
     ap.add_argument("--k", type=int, nargs="+", default=[50, 100],
                     help="Searchlight-Groessen (Santi: 50 Hauptanalyse, 100 Robustheit)")
     ap.add_argument("--min-vertices", type=int, default=20)
+    ap.add_argument("--surf-betas-dir", default="data/surface_betas",
+                    help="Verzeichnis mit {subj}_betas_surf_{hemi}_100.npy (Santis vorberechnete Oberflaechenbetas). "
+                         "Falls vorhanden, werden diese direkt verwendet; andernfalls Fallback auf vol_to_surf.")
     ap.add_argument("--save-tex", action="store_true",
                     help="projizierte (100,n_vert)-Betas speichern (fuer Betas-Check)")
-    ap.add_argument("--tda", action="store_true",
-                    help="Vertex-weise TDA (Wasserstein-Distanz) zusaetzlich berechnen")
-    ap.add_argument("--tda-maxdim", type=int, default=0, choices=[0, 1],
-                    help="Maximale Homologie-Dimension: 0=H0 (schnell), 1=H0+H1")
+    ap.add_argument("--tda-maxdim", type=int, default=2, choices=[0, 1, 2],
+                    help="Maximale Homologie-Dimension: 0=H0, 1=H0+H1, 2=H0+H1+H2 (Standard)")
     args = ap.parse_args()
 
     things = Path(args.things_root)
@@ -247,6 +249,7 @@ def main():
     (out / "results").mkdir(parents=True, exist_ok=True)
 
     areal_rows = []
+    areal_tda_rows = []
     for subj in args.subjects:
         sub = SUBJ_MAP[subj]
         print(f"\n==== {subj} ({sub}) ====", flush=True)
@@ -265,12 +268,10 @@ def main():
         ann_rank = np.stack(ann_rank)  # (6, n_pairs)
 
         # ANN-Persistenzdiagramme vorberechnen (einmal pro Proband, alle Layer)
-        ann_pds = None
-        if args.tda:
-            if not HAS_TDA:
-                raise ImportError("--tda benoetigt ripser und persim: pip install ripser persim")
-            print(f"  Vorberechnung ANN-Persistenzdiagramme (maxdim={args.tda_maxdim}) ...", flush=True)
-            ann_pds = compute_ann_pds(ann_rdms_raw, args.tda_maxdim)
+        if not HAS_TDA:
+            raise ImportError("ripser und persim benoetigt: pip install ripser persim")
+        print(f"  Vorberechnung ANN-Persistenzdiagramme (maxdim={args.tda_maxdim}) ...", flush=True)
+        ann_pds = compute_ann_pds(ann_rdms_raw, args.tda_maxdim)
 
         # Betas projizieren
         agg = aggregate_betas(things, sub, order)  # (100, n_vox)
@@ -290,10 +291,21 @@ def main():
         # Nachbar-Arrays einmal laden (max(k) Spalten reichen fuer alle k)
         nbr_full = {}
         k_max = max(args.k)
+        surf_betas_dir = PROJECT_ROOT / args.surf_betas_dir
         for hemi in ["lh", "rh"]:
-            white, pial = hemi_meshes(fs_dir, hemi, orig)
-            tex = project(beta_vol, white, pial, "linear").T  # (100, n_vert)
-            lab = np.rint(project(label_vol, white, pial, "nearest")).astype(np.int32)
+            # Santis vorberechnete Oberflaechenbetas (depth=0.5, trilinear)
+            santi_path = surf_betas_dir / f"{subj}_betas_surf_{hemi}_100.npy"
+            if santi_path.exists():
+                tex = np.load(santi_path)  # (100, n_vert)
+                print(f"  {hemi}: Santis Oberflaechenbetas geladen {tex.shape}", flush=True)
+                # Glasser-Labels per vol_to_surf (nur Label-Volumen, kein Beta-Volumen noetig)
+                white, pial = hemi_meshes(fs_dir, hemi, orig)
+                lab = np.rint(project(label_vol, white, pial, "nearest")).astype(np.int32)
+            else:
+                print(f"  {hemi}: Santis Betas nicht gefunden -> vol_to_surf Fallback", flush=True)
+                white, pial = hemi_meshes(fs_dir, hemi, orig)
+                tex = project(beta_vol, white, pial, "linear").T  # (100, n_vert)
+                lab = np.rint(project(label_vol, white, pial, "nearest")).astype(np.int32)
             nbr_full[hemi] = np.load(
                 nbr_dir / f"{subj}_neighbors_surf_{hemi}.npz")["indices"][:, :k_max]
             assert nbr_full[hemi].shape[0] == tex.shape[1], (
@@ -350,6 +362,21 @@ def main():
             # Searchlight liefert die vertexweise Karte (rsa_all/cka_all -> bestlayer).
             fmri_rdm = cosine_rdm_l2(tex_all[:, sel])
             np.save(out / "glasser" / f"{subj}_glasser-{area}_rdm.npy", fmri_rdm.astype(np.float32))
+
+            # Areal TDA (Glasser-Aggregation, ergaenzende Variante)
+            norm_area_rdm = _normalize_rdm(fmri_rdm)
+            area_dgms_raw = _ripser(norm_area_rdm, maxdim=args.tda_maxdim,
+                                    distance_matrix=True)["dgms"]
+            area_dgms = [dgm[np.isfinite(dgm[:, 1])] for dgm in area_dgms_raw]
+            for li, l in enumerate(LAYERS):
+                for hi in range(args.tda_maxdim + 1):
+                    wd_val = float(_wasserstein(area_dgms[hi], ann_pds[li][hi]))
+                    areal_tda_rows.append({
+                        "subject": subj, "area": area,
+                        "n_vertices": nvert, "layer": l,
+                        "hdim": hi, "wasserstein": round(wd_val, 6),
+                    })
+
             iu = np.triu_indices(fmri_rdm.shape[0], 1)
             fmri_rank = _zrank(fmri_rdm[iu])
             Kc_h = _double_center(1.0 - fmri_rdm)
@@ -371,6 +398,14 @@ def main():
         w.writeheader()
         w.writerows(areal_rows)
     print(f"\nFertig. Areal-Summary: {out_csv} ({len(areal_rows)} Zeilen)", flush=True)
+
+    out_tda_csv = out / "results" / "glasser_tda_summary.csv"
+    tda_fields = ["subject", "area", "n_vertices", "layer", "hdim", "wasserstein"]
+    with open(out_tda_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=tda_fields)
+        w.writeheader()
+        w.writerows(areal_tda_rows)
+    print(f"Areal-TDA-Summary: {out_tda_csv} ({len(areal_tda_rows)} Zeilen)", flush=True)
 
 
 if __name__ == "__main__":
