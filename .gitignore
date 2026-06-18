@@ -30,6 +30,13 @@ configs/tmp_*.json
 .ipynb_checkpoints/
 *.ipynb
 
+# LaTeX artefacts
+*.log
+texput.log
+
+# Matplotlib cache
+.matplotlib-cache/
+
 # MacOS
 .DS_Store
 
