@@ -14,7 +14,8 @@ Unterschied zur frueheren Fassung (run_v2_surface_searchlight.py):
   * geodaetische NN statt euklidischer cKDTree-50-NN,
   * CKA zusaetzlich zu RSA pro Vertex,
   * mehrere k-Werte in einem Lauf (Robustheitspruefung),
-  * areale Aggregation auf der Oberflaeche + oberflaechenbasierte Areal-RDMs.
+  * areale Aggregation auf der Oberflaeche + oberflaechenbasierte Areal-RDMs,
+  * optionale vertex-weise TDA (--tda): Wasserstein-Distanz pro Vertex und Layer.
 
 Alle fremden Daten werden NUR GELESEN:
   Santis Betas:    /work/dldevel/galella/datasets/THINGS-fMRI/betas_csv/*.h5
@@ -36,6 +37,13 @@ from nibabel.freesurfer import io as fsio
 from nibabel.affines import apply_affine
 from nilearn import surface
 from scipy.stats import rankdata
+
+try:
+    from ripser import ripser as _ripser
+    from persim import wasserstein as _wasserstein
+    HAS_TDA = True
+except ImportError:
+    HAS_TDA = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
@@ -138,17 +146,43 @@ def cka_from_centered(Kc_h, ann_centered, ann_self):
     return out
 
 
-def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self):
+def _normalize_rdm(rdm):
+    m = rdm.max()
+    return rdm / m if m > 0 else rdm
+
+
+def compute_ann_pds(ann_rdms_raw, maxdim):
+    """Vorberechnung der ANN-Persistenzdiagramme (einmal pro Layer).
+
+    Gibt eine Liste zurueck: pds[layer_idx][hdim] = array (n_features, 2)
+    ohne unendliche Todeszeiten.
+    """
+    pds = []
+    for rdm in ann_rdms_raw:
+        norm = _normalize_rdm(rdm)
+        dgms = _ripser(norm, maxdim=maxdim, distance_matrix=True)["dgms"]
+        pds.append([dgm[np.isfinite(dgm[:, 1])] for dgm in dgms])
+    return pds
+
+
+def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self,
+                ann_pds=None, tda_maxdim=0):
     """tex: (100, n_vert). neighbors: (n_vert, k) int. Pro Vertex RSA + CKA je Layer.
 
     RSA vektorisiert: ANN-Dreiecke vorgerankt/z-normiert, fMRI-RDM einmal ranken,
     alle 6 Spearman-Korrelationen per Matrixprodukt. CKA per Doppel-Zentrierung.
+
+    Wenn ann_pds angegeben: zusaetzlich TDA-Wasserstein-Distanz pro Vertex und Layer.
+    ann_pds[layer_idx][hdim] = vorberechnetes ANN-Persistenzdiagramm.
     """
     n_stim, n_vert = tex.shape
     iu = np.triu_indices(n_stim, 1)
     n_pairs = iu[0].size
     rsa = np.full((n_vert, len(LAYERS)), np.nan, dtype=np.float32)
     cka = np.full((n_vert, len(LAYERS)), np.nan, dtype=np.float32)
+    n_hdim = tda_maxdim + 1
+    wd = np.full((n_vert, len(LAYERS), n_hdim), np.nan, dtype=np.float32) \
+        if ann_pds is not None else None
     for v in range(n_vert):
         patch = tex[:, neighbors[v]]  # (n_stim, k)
         norms = np.linalg.norm(patch, axis=1, keepdims=True)
@@ -162,7 +196,18 @@ def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self):
         rsa[v] = (ann_rank @ _zrank(tri)) / n_pairs
         Kc_h = _double_center(sim)
         cka[v] = cka_from_centered(Kc_h, ann_centered, ann_self)
-    return rsa, cka
+        if ann_pds is not None:
+            rdm_v = _normalize_rdm(1.0 - sim)
+            dgms_v = _ripser(rdm_v, maxdim=tda_maxdim, distance_matrix=True)["dgms"]
+            for hi in range(n_hdim):
+                fmri_dgm = dgms_v[hi][np.isfinite(dgms_v[hi][:, 1])]
+                for li in range(len(LAYERS)):
+                    ann_dgm = ann_pds[li][hi]
+                    if len(fmri_dgm) == 0 and len(ann_dgm) == 0:
+                        wd[v, li, hi] = 0.0
+                    else:
+                        wd[v, li, hi] = float(_wasserstein(ann_dgm, fmri_dgm))
+    return rsa, cka, wd
 
 
 def cosine_rdm_l2(features):
@@ -188,6 +233,10 @@ def main():
     ap.add_argument("--min-vertices", type=int, default=20)
     ap.add_argument("--save-tex", action="store_true",
                     help="projizierte (100,n_vert)-Betas speichern (fuer Betas-Check)")
+    ap.add_argument("--tda", action="store_true",
+                    help="Vertex-weise TDA (Wasserstein-Distanz) zusaetzlich berechnen")
+    ap.add_argument("--tda-maxdim", type=int, default=0, choices=[0, 1],
+                    help="Maximale Homologie-Dimension: 0=H0 (schnell), 1=H0+H1")
     args = ap.parse_args()
 
     things = Path(args.things_root)
@@ -204,15 +253,24 @@ def main():
         order = [r["image_id"] for r in csv.DictReader(
             open(PROJECT_ROOT / args.ann_order_dir / f"ann_resnet50_{subj}_matched_image_order.csv"))]
 
-        # ANN-RDMs vorbereiten: Rang-Dreiecke (RSA) und zentrierte Kernel (CKA)
-        ann_rank, ann_centered, ann_self = [], [], []
+        # ANN-RDMs vorbereiten: Rang-Dreiecke (RSA), zentrierte Kernel (CKA), Roh-RDMs (TDA)
+        ann_rank, ann_centered, ann_self, ann_rdms_raw = [], [], [], []
         for l in LAYERS:
             rdm = np.load(PROJECT_ROOT / args.ann_geometry / f"ann_resnet50_{subj}_matched_{l}_cosine.npy")
+            ann_rdms_raw.append(rdm)
             ann_rank.append(_zrank(upper_triangle_values(rdm)))
             Kd = _double_center(1.0 - rdm)
             ann_centered.append(Kd)
             ann_self.append(float(np.sum(Kd * Kd)))
         ann_rank = np.stack(ann_rank)  # (6, n_pairs)
+
+        # ANN-Persistenzdiagramme vorberechnen (einmal pro Proband, alle Layer)
+        ann_pds = None
+        if args.tda:
+            if not HAS_TDA:
+                raise ImportError("--tda benoetigt ripser und persim: pip install ripser persim")
+            print(f"  Vorberechnung ANN-Persistenzdiagramme (maxdim={args.tda_maxdim}) ...", flush=True)
+            ann_pds = compute_ann_pds(ann_rdms_raw, args.tda_maxdim)
 
         # Betas projizieren
         agg = aggregate_betas(things, sub, order)  # (100, n_vox)
@@ -245,7 +303,8 @@ def main():
             for k in args.k:
                 nbr_k = nbr_full[hemi][:, :k]
                 print(f"  {hemi}: tex {tex.shape}, geodaetischer Searchlight k={k} ...", flush=True)
-                rsa, cka = searchlight(tex, nbr_k, ann_rank, ann_centered, ann_self)
+                rsa, cka, wd = searchlight(tex, nbr_k, ann_rank, ann_centered, ann_self,
+                                           ann_pds=ann_pds, tda_maxdim=args.tda_maxdim)
                 tag = f"k{k}"
                 np.save(out / "searchlight" / f"{subj}_{hemi}_rsa_perlayer_{tag}.npy", rsa)
                 np.save(out / "searchlight" / f"{subj}_{hemi}_cka_perlayer_{tag}.npy", cka)
@@ -255,6 +314,21 @@ def main():
                 np.save(out / "searchlight" / f"{subj}_{hemi}_bestlayer_{tag}.npy", best)
                 np.save(out / "searchlight" / f"{subj}_{hemi}_peakr_{tag}.npy",
                         np.nanmax(rsa, axis=1).astype(np.float32))
+                if wd is not None:
+                    n_hdim = args.tda_maxdim + 1
+                    for hi in range(n_hdim):
+                        np.save(out / "searchlight" /
+                                f"{subj}_{hemi}_tda_wd_H{hi}_perlayer_{tag}.npy",
+                                wd[:, :, hi].astype(np.float32))
+                    # Beste Schicht nach minimaler WD (Mittel ueber H-Dimensionen)
+                    wd_mean = np.nanmean(wd, axis=2)  # (n_vert, 6)
+                    best_tda = np.full(wd_mean.shape[0], np.nan, dtype=np.float32)
+                    ok_tda = ~np.all(np.isnan(wd_mean), axis=1)
+                    best_tda[ok_tda] = np.nanargmin(
+                        np.where(np.isnan(wd_mean[ok_tda]), np.inf, wd_mean[ok_tda]), axis=1)
+                    np.save(out / "searchlight" /
+                            f"{subj}_{hemi}_tda_bestlayer_{tag}.npy", best_tda)
+                    print(f"    TDA-Outputs gespeichert (H0..H{args.tda_maxdim})", flush=True)
             if args.save_tex:
                 np.save(out / "searchlight" / f"{subj}_{hemi}_tex.npy", tex.astype(np.float32))
             tex_all.append(tex)
