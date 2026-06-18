@@ -26,6 +26,7 @@ Ausgaben nur in outputs_resnet50_v2_surface/ (weniger-Bereich).
 """
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from nibabel.freesurfer import io as fsio
 from nibabel.affines import apply_affine
 from nilearn import surface
 from scipy.stats import rankdata
+from joblib import Parallel, delayed
 
 try:
     from ripser import ripser as _ripser
@@ -166,8 +168,40 @@ def compute_ann_pds(ann_rdms_raw, maxdim):
     return pds
 
 
+def _vertex_work(v, tex_v_neighbors, iu, n_pairs, ann_rank, ann_centered, ann_self,
+                 ann_pds, tda_maxdim):
+    """Berechnung fuer einen einzelnen Vertex: RSA, CKA, optional TDA."""
+    patch = tex_v_neighbors  # (n_stim, k)
+    norms = np.linalg.norm(patch, axis=1, keepdims=True)
+    if not np.all(norms > 0):
+        return None
+    p = patch / norms
+    sim = p @ p.T
+    tri = (1.0 - sim)[iu]
+    if not np.isfinite(tri).all() or tri.std() == 0:
+        return None
+    rsa_v = (ann_rank @ _zrank(tri)) / n_pairs
+    Kc_h = _double_center(sim)
+    cka_v = cka_from_centered(Kc_h, ann_centered, ann_self)
+    wd_v = None
+    if ann_pds is not None:
+        n_hdim = tda_maxdim + 1
+        rdm_v = _normalize_rdm(1.0 - sim)
+        dgms_v = _ripser(rdm_v, maxdim=tda_maxdim, distance_matrix=True)["dgms"]
+        wd_v = np.full((len(LAYERS), n_hdim), np.nan, dtype=np.float32)
+        for hi in range(n_hdim):
+            fmri_dgm = dgms_v[hi][np.isfinite(dgms_v[hi][:, 1])]
+            for li in range(len(LAYERS)):
+                ann_dgm = ann_pds[li][hi]
+                if len(fmri_dgm) == 0 and len(ann_dgm) == 0:
+                    wd_v[li, hi] = 0.0
+                else:
+                    wd_v[li, hi] = float(_wasserstein(ann_dgm, fmri_dgm))
+    return rsa_v, cka_v, wd_v
+
+
 def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self,
-                ann_pds=None, tda_maxdim=0):
+                ann_pds=None, tda_maxdim=0, n_jobs=1):
     """tex: (100, n_vert). neighbors: (n_vert, k) int. Pro Vertex RSA + CKA je Layer.
 
     RSA vektorisiert: ANN-Dreiecke vorgerankt/z-normiert, fMRI-RDM einmal ranken,
@@ -175,6 +209,8 @@ def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self,
 
     Wenn ann_pds angegeben: zusaetzlich TDA-Wasserstein-Distanz pro Vertex und Layer.
     ann_pds[layer_idx][hdim] = vorberechnetes ANN-Persistenzdiagramm.
+
+    n_jobs: Anzahl paralleler Threads (prefer='threads'; ripser/persim geben GIL frei).
     """
     n_stim, n_vert = tex.shape
     iu = np.triu_indices(n_stim, 1)
@@ -184,30 +220,22 @@ def searchlight(tex, neighbors, ann_rank, ann_centered, ann_self,
     n_hdim = tda_maxdim + 1
     wd = np.full((n_vert, len(LAYERS), n_hdim), np.nan, dtype=np.float32) \
         if ann_pds is not None else None
-    for v in range(n_vert):
-        patch = tex[:, neighbors[v]]  # (n_stim, k)
-        norms = np.linalg.norm(patch, axis=1, keepdims=True)
-        if not np.all(norms > 0):
+
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_vertex_work)(
+            v, tex[:, neighbors[v]], iu, n_pairs,
+            ann_rank, ann_centered, ann_self, ann_pds, tda_maxdim
+        )
+        for v in range(n_vert)
+    )
+    for v, res in enumerate(results):
+        if res is None:
             continue
-        p = patch / norms
-        sim = p @ p.T  # Cosine-Aehnlichkeit (100x100)
-        tri = (1.0 - sim)[iu]
-        if not np.isfinite(tri).all() or tri.std() == 0:
-            continue
-        rsa[v] = (ann_rank @ _zrank(tri)) / n_pairs
-        Kc_h = _double_center(sim)
-        cka[v] = cka_from_centered(Kc_h, ann_centered, ann_self)
-        if ann_pds is not None:
-            rdm_v = _normalize_rdm(1.0 - sim)
-            dgms_v = _ripser(rdm_v, maxdim=tda_maxdim, distance_matrix=True)["dgms"]
-            for hi in range(n_hdim):
-                fmri_dgm = dgms_v[hi][np.isfinite(dgms_v[hi][:, 1])]
-                for li in range(len(LAYERS)):
-                    ann_dgm = ann_pds[li][hi]
-                    if len(fmri_dgm) == 0 and len(ann_dgm) == 0:
-                        wd[v, li, hi] = 0.0
-                    else:
-                        wd[v, li, hi] = float(_wasserstein(ann_dgm, fmri_dgm))
+        rsa_v, cka_v, wd_v = res
+        rsa[v] = rsa_v
+        cka[v] = cka_v
+        if wd_v is not None:
+            wd[v] = wd_v
     return rsa, cka, wd
 
 
@@ -239,7 +267,15 @@ def main():
                     help="projizierte (100,n_vert)-Betas speichern (fuer Betas-Check)")
     ap.add_argument("--tda-maxdim", type=int, default=2, choices=[0, 1, 2],
                     help="Maximale Homologie-Dimension: 0=H0, 1=H0+H1, 2=H0+H1+H2 (Standard)")
+    ap.add_argument("--tda-k", type=int, nargs="+", default=None,
+                    help="k-Werte fuer die TDA berechnet wird (Standard: alle k-Werte). "
+                         "Beispiel: --tda-k 50 berechnet TDA nur fuer k=50.")
+    ap.add_argument("--n-jobs", type=int, default=1,
+                    help="Anzahl paralleler Threads fuer den Vertex-Searchlight "
+                         "(Standard: 1). Auf dem Cluster: --n-jobs 16.")
     args = ap.parse_args()
+    if args.tda_k is None:
+        args.tda_k = args.k
 
     things = Path(args.things_root)
     nbr_dir = PROJECT_ROOT / args.neighbors_dir
@@ -315,8 +351,11 @@ def main():
             for k in args.k:
                 nbr_k = nbr_full[hemi][:, :k]
                 print(f"  {hemi}: tex {tex.shape}, geodaetischer Searchlight k={k} ...", flush=True)
+                run_tda = k in args.tda_k
                 rsa, cka, wd = searchlight(tex, nbr_k, ann_rank, ann_centered, ann_self,
-                                           ann_pds=ann_pds, tda_maxdim=args.tda_maxdim)
+                                           ann_pds=ann_pds if run_tda else None,
+                                           tda_maxdim=args.tda_maxdim,
+                                           n_jobs=args.n_jobs)
                 tag = f"k{k}"
                 np.save(out / "searchlight" / f"{subj}_{hemi}_rsa_perlayer_{tag}.npy", rsa)
                 np.save(out / "searchlight" / f"{subj}_{hemi}_cka_perlayer_{tag}.npy", cka)
