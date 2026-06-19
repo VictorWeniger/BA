@@ -5,3 +5,8 @@ Pillow
 matplotlib
 ripser
 persim
+nibabel
+nilearn
+scipy
+joblib
+seaborn
