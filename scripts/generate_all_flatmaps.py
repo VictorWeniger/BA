@@ -1,33 +1,30 @@
 """
-Erzeugt alle Flatmap-Abbildungen für die BA:
-  RSA (6 Schichten + Peak + BestLayer)
-  CKA (6 Schichten)
-  TDA Wasserstein H0 (6 Schichten + BestLayer)
-  TDA Wasserstein H1 (6 Schichten)
+Alle kortikalen Flatmaps: RSA, CKA, TDA H0/H1, Best-Layer-Karten.
+Direkte tripcolor-Darstellung auf den fsaverage-Flat-Koordinaten (kein nilearn-Bug).
+lh: 270° gedreht; rh: 270° gedreht + horizontal gespiegelt → Medialwände innen.
 
 Aufruf:
   python3 generate_all_flatmaps.py [--k 50] [--subject S1]
 """
 import argparse
-import tempfile
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
+import matplotlib.tri as mtri
 from matplotlib.colors import Normalize, BoundaryNorm
 from matplotlib.cm import ScalarMappable
 from pathlib import Path
 from nibabel.freesurfer import io as fsio
-from nilearn import datasets, plotting, surface
+from nilearn import datasets, surface
 from scipy.spatial import cKDTree
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--k",       type=int, default=50)
-ap.add_argument("--subject",           default="S1")
+ap.add_argument("--k",      type=int, default=50)
+ap.add_argument("--subject",          default="S1")
 args = ap.parse_args()
 
-TAG  = f"k{args.k}"
+TAG    = f"k{args.k}"
 LAYERS = ["conv1", "layer1", "layer2", "layer3", "layer4", "fc"]
 subj   = args.subject
 
@@ -40,77 +37,85 @@ FIG_DIR.mkdir(parents=True, exist_ok=True)
 print("Lade fsaverage …")
 fsa = datasets.fetch_surf_fsaverage(mesh="fsaverage")
 
-# KD-Trees für lh und rh einmal bauen
+# ── Flat-Surface-Geometrie mit Rotation aufbauen ──────────────────────────────
+
+ROT_LH =   0    # lh: keine Rotation
+ROT_RH =   0    # rh: keine Rotation (beide 90° zueinander gedreht ggü. ±90°)
+
+def rotate2d(xy, deg):
+    r = np.radians(deg)
+    R = np.array([[np.cos(r), -np.sin(r)],
+                  [np.sin(r),  np.cos(r)]])
+    return (R @ xy.T).T
+
+def build_surface(hemi):
+    key   = "flat_left" if hemi == "lh" else "flat_right"
+    mesh  = surface.load_surf_mesh(fsa[key])
+    c     = mesh.coordinates
+    f     = mesh.faces
+    sulc  = surface.load_surf_data(
+        fsa["sulc_left"] if hemi == "lh" else fsa["sulc_right"])
+
+    rot = ROT_LH if hemi == "lh" else ROT_RH
+    xy  = rotate2d(c[:, :2], rot)
+
+    # Nahtdreiecke entfernen
+    xf   = xy[f, 0]
+    keep = np.abs(xf.max(axis=1) - xf.min(axis=1)) < 100
+    tri  = mtri.Triangulation(xy[:, 0], xy[:, 1], f[keep])
+    return tri, sulc
+
+print("Baue Dreiecksgitter …")
+surfs = {h: build_surface(h) for h in ["lh", "rh"]}
+
+# ── Resample S1 → fsaverage ───────────────────────────────────────────────────
+
 trees = {}
 for hemi in ["lh", "rh"]:
     s1_reg, _ = fsio.read_geometry(FS_DIR / f"{hemi}.sphere.reg")
-    trees[hemi] = (s1_reg, cKDTree(s1_reg))
+    trees[hemi] = cKDTree(s1_reg)
 
 def resample(hemi, values):
-    s1_reg, tree = trees[hemi]
-    fsa_key  = "sphere_left" if hemi == "lh" else "sphere_right"
-    fsa_sph  = surface.load_surf_mesh(fsa[fsa_key]).coordinates
-    _, idx   = tree.query(fsa_sph)
-    out = np.full(len(idx), np.nan)
-    valid = np.isfinite(values)
-    out[np.arange(len(idx))] = np.where(valid[idx], values[idx], np.nan)
+    fsa_key = "sphere_left" if hemi == "lh" else "sphere_right"
+    fsa_sph = surface.load_surf_mesh(fsa[fsa_key]).coordinates
+    _, idx  = trees[hemi].query(fsa_sph)
+    out = np.where(np.isfinite(values[idx]), values[idx], np.nan)
     return out
 
 def load(name):
     return np.load(SL_DIR / f"{subj}_{name}_{TAG}.npy")
 
-def sulc(hemi):
-    return surface.load_surf_data(
-        fsa["sulc_left"] if hemi == "lh" else fsa["sulc_right"])
 
-def flat_mesh(hemi):
-    return fsa["flat_left"] if hemi == "lh" else fsa["flat_right"]
+# ── Zeichenroutinen ───────────────────────────────────────────────────────────
 
-
-# ── Render-Hilfsfunktionen ────────────────────────────────────────────────────
-
-def render_hemi(hemi, stat_fsa, vmin, vmax, cmap, tmp_dir, tag):
-    fig = plotting.plot_surf_stat_map(
-        flat_mesh(hemi),
-        stat_map=np.nan_to_num(stat_fsa, nan=0.0),
-        bg_map=sulc(hemi),
-        hemi="left" if hemi == "lh" else "right",
-        view="dorsal",
-        cmap=cmap,
-        vmin=vmin, vmax=vmax,
-        colorbar=False,
-        bg_on_data=True,
-    )
-    p = Path(tmp_dir) / f"{hemi}_{tag}.png"
-    fig.savefig(str(p), dpi=150, bbox_inches="tight")
-    plt.close("all")
-    return p
+def draw_hemi(ax, hemi, values_fsa, cmap, norm):
+    tri, sulc = surfs[hemi]
+    # Hintergrund: sulcal depth
+    ax.tripcolor(tri, np.clip(sulc, -5, 5), cmap="gray",
+                 shading="gouraud", vmin=-5, vmax=5, rasterized=True)
+    # Vordergrund: Metrik
+    vis = np.where(np.isfinite(values_fsa), values_fsa,
+                   np.nanmean(values_fsa[np.isfinite(values_fsa)]))
+    ax.tripcolor(tri, vis, cmap=cmap, norm=norm,
+                 shading="gouraud", alpha=0.85, rasterized=True)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title("Linke Hemisphäre" if hemi == "lh" else "Rechte Hemisphäre",
+                 fontsize=12, pad=6)
 
 
-def assemble(panels_lh, panels_rh, title, cmap, vmin, vmax, out_path,
-             cbar_label, discrete_colors=None):
-    """Baut lh + rh Panels zu einer Figure zusammen."""
+def save_fig(title, cmap, norm, out_path, cbar_label,
+             vals_lh, vals_rh, discrete_ticks=None):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
-    for ax, hemi, p in zip(axes, ["lh", "rh"], [panels_lh, panels_rh]):
-        ax.imshow(mpimg.imread(str(p)))
-        ax.axis("off")
-        ax.set_title("Linke Hemisphäre" if hemi == "lh" else "Rechte Hemisphäre",
-                     fontsize=12, pad=6)
+    draw_hemi(axes[0], "lh", vals_lh, cmap, norm)
+    draw_hemi(axes[1], "rh", vals_rh, cmap, norm)
 
-    if discrete_colors is not None:
-        bounds = np.arange(-0.5, len(LAYERS))
-        norm   = BoundaryNorm(bounds, len(LAYERS))
-        sm     = ScalarMappable(cmap=matplotlib.colormaps[cmap], norm=norm)
-        sm.set_array([])
-        cbar   = fig.colorbar(sm, ax=axes, shrink=0.7, pad=0.015, aspect=22,
-                               ticks=range(len(LAYERS)))
+    sm = ScalarMappable(cmap=matplotlib.colormaps[cmap], norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes, shrink=0.72, pad=0.015, aspect=25)
+    if discrete_ticks is not None:
+        cbar.set_ticks(range(len(LAYERS)))
         cbar.set_ticklabels(LAYERS)
-    else:
-        sm   = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax),
-                              cmap=matplotlib.colormaps[cmap])
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=axes, shrink=0.7, pad=0.015, aspect=25)
-
     cbar.set_label(cbar_label, fontsize=11)
     cbar.ax.tick_params(labelsize=9)
     fig.suptitle(title, fontsize=13, y=1.01)
@@ -119,109 +124,94 @@ def assemble(panels_lh, panels_rh, title, cmap, vmin, vmax, out_path,
     print("  →", out_path.name)
 
 
-# ── Alle Karten erzeugen ──────────────────────────────────────────────────────
+# ── RSA (6 Schichten) ─────────────────────────────────────────────────────────
+print("\n=== RSA ===")
+rsa_raw = {h: load(f"{h}_rsa_perlayer") for h in ["lh", "rh"]}
+all_rsa = np.concatenate([rsa_raw["lh"].ravel(), rsa_raw["rh"].ravel()])
+rsa_abs = float(np.nanpercentile(np.abs(all_rsa[np.isfinite(all_rsa)]), 95))
 
-with tempfile.TemporaryDirectory() as tmp:
+for li, layer in enumerate(LAYERS):
+    save_fig(
+        f"RSA Spearman $r$ — Schicht {layer}  ({subj}, {TAG})",
+        "RdBu_r", Normalize(-rsa_abs, rsa_abs),
+        FIG_DIR / f"fig_flatmap_rsa_{layer}_{TAG}_{subj}.pdf",
+        "Spearman $r$",
+        resample("lh", rsa_raw["lh"][:, li]),
+        resample("rh", rsa_raw["rh"][:, li]),
+    )
 
-    # ── RSA (6 Schichten) ─────────────────────────────────────────────────────
-    print("\n=== RSA (6 Schichten) ===")
-    rsa_data = {h: load(f"{h}_rsa_perlayer") for h in ["lh","rh"]}
-    all_rsa  = np.concatenate([rsa_data["lh"].ravel(), rsa_data["rh"].ravel()])
-    rsa_abs  = np.nanpercentile(np.abs(all_rsa[np.isfinite(all_rsa)]), 95)
+# ── Peak-RSA ──────────────────────────────────────────────────────────────────
+print("\n=== Peak-RSA ===")
+peak_raw = {h: load(f"{h}_peakr") for h in ["lh", "rh"]}
+all_peak = np.concatenate([peak_raw["lh"], peak_raw["rh"]])
+peak_max = float(np.nanpercentile(all_peak[np.isfinite(all_peak)], 95))
+save_fig(
+    f"Peak-RSA (max Spearman $r$ über Schichten)  ({subj}, {TAG})",
+    "hot", Normalize(0, peak_max),
+    FIG_DIR / f"fig_flatmap_peakr_{TAG}_{subj}.pdf",
+    "Peak Spearman $r$",
+    resample("lh", peak_raw["lh"]),
+    resample("rh", peak_raw["rh"]),
+)
+
+# ── RSA Best-Layer ────────────────────────────────────────────────────────────
+print("\n=== RSA Best-Layer ===")
+best_raw = {h: load(f"{h}_bestlayer") for h in ["lh", "rh"]}
+save_fig(
+    f"Beste RSA-Schicht je Vertex  ({subj}, {TAG})",
+    "viridis", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
+    FIG_DIR / f"fig_flatmap_rsa_bestlayer_{TAG}_{subj}.pdf",
+    "Beste Schicht",
+    resample("lh", best_raw["lh"]),
+    resample("rh", best_raw["rh"]),
+    discrete_ticks=True,
+)
+
+# ── CKA (6 Schichten) ─────────────────────────────────────────────────────────
+print("\n=== CKA ===")
+cka_raw = {h: load(f"{h}_cka_perlayer") for h in ["lh", "rh"]}
+all_cka = np.concatenate([cka_raw["lh"].ravel(), cka_raw["rh"].ravel()])
+cka_max = float(np.nanpercentile(all_cka[np.isfinite(all_cka)], 95))
+
+for li, layer in enumerate(LAYERS):
+    save_fig(
+        f"CKA — Schicht {layer}  ({subj}, {TAG})",
+        "YlOrRd", Normalize(0, cka_max),
+        FIG_DIR / f"fig_flatmap_cka_{layer}_{TAG}_{subj}.pdf",
+        "CKA",
+        resample("lh", cka_raw["lh"][:, li]),
+        resample("rh", cka_raw["rh"][:, li]),
+    )
+
+# ── TDA H0 + H1 (je 6 Schichten) ─────────────────────────────────────────────
+for hdim in [0, 1]:
+    print(f"\n=== TDA H{hdim} ===")
+    wd_raw = {h: load(f"{h}_tda_wd_H{hdim}_perlayer") for h in ["lh", "rh"]}
+    all_wd = np.concatenate([wd_raw["lh"].ravel(), wd_raw["rh"].ravel()])
+    wd_min = float(np.nanpercentile(all_wd[np.isfinite(all_wd)],  5))
+    wd_max = float(np.nanpercentile(all_wd[np.isfinite(all_wd)], 95))
 
     for li, layer in enumerate(LAYERS):
-        panels = {}
-        for hemi in ["lh","rh"]:
-            v = resample(hemi, rsa_data[hemi][:, li])
-            panels[hemi] = render_hemi(hemi, v, -rsa_abs, rsa_abs,
-                                       "RdBu_r", tmp, f"rsa_{layer}_{hemi}")
-        assemble(panels["lh"], panels["rh"],
-                 f"RSA Spearman $r$ — Schicht {layer}  ({subj}, {TAG})",
-                 "RdBu_r", -rsa_abs, rsa_abs,
-                 FIG_DIR / f"fig_flatmap_rsa_{layer}_{TAG}_{subj}.pdf",
-                 "Spearman $r$")
+        save_fig(
+            f"TDA Wasserstein-Distanz $H_{hdim}$ — Schicht {layer}  ({subj}, {TAG})",
+            "plasma", Normalize(wd_min, wd_max),
+            FIG_DIR / f"fig_flatmap_tda_H{hdim}_{layer}_{TAG}_{subj}.pdf",
+            f"Wasserstein-Distanz $H_{hdim}$",
+            resample("lh", wd_raw["lh"][:, li]),
+            resample("rh", wd_raw["rh"][:, li]),
+        )
 
-    # ── Peak-RSA ──────────────────────────────────────────────────────────────
-    print("\n=== Peak-RSA ===")
-    peak_data = {h: load(f"{h}_peakr") for h in ["lh","rh"]}
-    all_peak  = np.concatenate([peak_data["lh"], peak_data["rh"]])
-    peak_max  = float(np.nanpercentile(all_peak[np.isfinite(all_peak)], 95))
-    panels = {}
-    for hemi in ["lh","rh"]:
-        v = resample(hemi, peak_data[hemi])
-        panels[hemi] = render_hemi(hemi, v, 0, peak_max, "hot", tmp, f"peakr_{hemi}")
-    assemble(panels["lh"], panels["rh"],
-             f"Peak-RSA (max Spearman $r$ über Schichten)  ({subj}, {TAG})",
-             "hot", 0, peak_max,
-             FIG_DIR / f"fig_flatmap_peakr_{TAG}_{subj}.pdf",
-             "Peak Spearman $r$")
+# ── TDA Best-Layer ────────────────────────────────────────────────────────────
+print("\n=== TDA Best-Layer ===")
+tda_best = {h: load(f"{h}_tda_bestlayer") for h in ["lh", "rh"]}
+save_fig(
+    f"Beste TDA-Schicht je Vertex (min Wasserstein)  ({subj}, {TAG})",
+    "viridis", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
+    FIG_DIR / f"fig_flatmap_tda_bestlayer_{TAG}_{subj}.pdf",
+    "Beste Schicht (min Wasserstein)",
+    resample("lh", tda_best["lh"]),
+    resample("rh", tda_best["rh"]),
+    discrete_ticks=True,
+)
 
-    # ── RSA Best-Layer ────────────────────────────────────────────────────────
-    print("\n=== RSA Best-Layer ===")
-    best_data = {h: load(f"{h}_bestlayer") for h in ["lh","rh"]}
-    panels = {}
-    for hemi in ["lh","rh"]:
-        v = resample(hemi, best_data[hemi])
-        panels[hemi] = render_hemi(hemi, v, 0, 5, "viridis", tmp, f"bestlayer_{hemi}")
-    assemble(panels["lh"], panels["rh"],
-             f"Beste RSA-Schicht je Vertex  ({subj}, {TAG})",
-             "viridis", 0, 5,
-             FIG_DIR / f"fig_flatmap_rsa_bestlayer_{TAG}_{subj}.pdf",
-             "Beste Schicht",
-             discrete_colors=True)
-
-    # ── CKA (6 Schichten) ─────────────────────────────────────────────────────
-    print("\n=== CKA (6 Schichten) ===")
-    cka_data = {h: load(f"{h}_cka_perlayer") for h in ["lh","rh"]}
-    all_cka  = np.concatenate([cka_data["lh"].ravel(), cka_data["rh"].ravel()])
-    cka_max  = float(np.nanpercentile(all_cka[np.isfinite(all_cka)], 95))
-
-    for li, layer in enumerate(LAYERS):
-        panels = {}
-        for hemi in ["lh","rh"]:
-            v = resample(hemi, cka_data[hemi][:, li])
-            panels[hemi] = render_hemi(hemi, v, 0, cka_max,
-                                       "YlOrRd", tmp, f"cka_{layer}_{hemi}")
-        assemble(panels["lh"], panels["rh"],
-                 f"CKA — Schicht {layer}  ({subj}, {TAG})",
-                 "YlOrRd", 0, cka_max,
-                 FIG_DIR / f"fig_flatmap_cka_{layer}_{TAG}_{subj}.pdf",
-                 "CKA")
-
-    # ── TDA Wasserstein H0 + H1 (je 6 Schichten) ─────────────────────────────
-    for hdim in [0, 1]:
-        print(f"\n=== TDA Wasserstein H{hdim} (6 Schichten) ===")
-        wd_data = {h: load(f"{h}_tda_wd_H{hdim}_perlayer") for h in ["lh","rh"]}
-        all_wd  = np.concatenate([wd_data["lh"].ravel(), wd_data["rh"].ravel()])
-        wd_min  = float(np.nanpercentile(all_wd[np.isfinite(all_wd)],  5))
-        wd_max  = float(np.nanpercentile(all_wd[np.isfinite(all_wd)], 95))
-
-        for li, layer in enumerate(LAYERS):
-            panels = {}
-            for hemi in ["lh","rh"]:
-                v = resample(hemi, wd_data[hemi][:, li])
-                panels[hemi] = render_hemi(hemi, v, wd_min, wd_max,
-                                           "plasma", tmp,
-                                           f"wd_H{hdim}_{layer}_{hemi}")
-            assemble(panels["lh"], panels["rh"],
-                     f"TDA Wasserstein-Distanz $H_{hdim}$ — Schicht {layer}  ({subj}, {TAG})",
-                     "plasma", wd_min, wd_max,
-                     FIG_DIR / f"fig_flatmap_tda_H{hdim}_{layer}_{TAG}_{subj}.pdf",
-                     f"Wasserstein-Distanz $H_{hdim}$")
-
-    # ── TDA Best-Layer ────────────────────────────────────────────────────────
-    print("\n=== TDA Best-Layer ===")
-    tda_best = {h: load(f"{h}_tda_bestlayer") for h in ["lh","rh"]}
-    panels = {}
-    for hemi in ["lh","rh"]:
-        v = resample(hemi, tda_best[hemi])
-        panels[hemi] = render_hemi(hemi, v, 0, 5, "viridis", tmp,
-                                   f"tda_bestlayer_{hemi}")
-    assemble(panels["lh"], panels["rh"],
-             f"Beste TDA-Schicht je Vertex (min WD)  ({subj}, {TAG})",
-             "viridis", 0, 5,
-             FIG_DIR / f"fig_flatmap_tda_bestlayer_{TAG}_{subj}.pdf",
-             "Beste Schicht (min Wasserstein)",
-             discrete_colors=True)
-
-print("\nFertig. Alle Abbildungen in:", FIG_DIR)
+print(f"\nFertig. Alle Abbildungen in: {FIG_DIR}")
