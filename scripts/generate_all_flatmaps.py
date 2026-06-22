@@ -15,13 +15,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
-from matplotlib.colors import Normalize, BoundaryNorm
+from matplotlib.colors import Normalize, BoundaryNorm, ListedColormap
 from matplotlib.cm import ScalarMappable
 from pathlib import Path
 from nibabel.freesurfer import io as fsio
 from nilearn import datasets, surface
 from scipy.spatial import cKDTree
 from scipy.stats import t as t_dist
+
+# 6 klar unterscheidbare Farben (aus tab10) für kategoriale Layer-Karten
+_tab10 = matplotlib.colormaps["tab10"]
+CMAP_LAYERS = ListedColormap([_tab10(i) for i in range(6)], name="layers6")
+matplotlib.colormaps.register(CMAP_LAYERS, force=True)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--k",      type=int, default=50)
@@ -102,7 +107,7 @@ def rsa_pval(r):
 
 # ── Zeichenroutinen ───────────────────────────────────────────────────────────
 
-def draw_hemi(ax, hemi, values_fsa, cmap, norm):
+def draw_hemi(ax, hemi, values_fsa, cmap, norm, discrete=False):
     tri, sulc = surfs[hemi]
     # Hintergrund: sulcal depth für alle Vertices
     ax.tripcolor(tri, np.clip(sulc, -5, 5), cmap="gray",
@@ -113,9 +118,20 @@ def draw_hemi(ax, hemi, values_fsa, cmap, norm):
         faces = tri.triangles
         valid_faces = np.all(valid[faces], axis=1)
         if valid_faces.any():
-            masked_tri = mtri.Triangulation(tri.x, tri.y, faces[valid_faces])
-            ax.tripcolor(masked_tri, values_fsa, cmap=cmap, norm=norm,
-                         shading="gouraud", alpha=0.85, rasterized=True)
+            sel_faces = faces[valid_faces]
+            masked_tri = mtri.Triangulation(tri.x, tri.y, sel_faces)
+            if discrete:
+                # Flat shading: ein Farbwert pro Dreieck via Mehrheitsentscheid
+                # → keine Farbinterpolation zwischen diskreten Layer-Werten
+                vv = np.round(values_fsa[sel_faces]).astype(int).clip(0, len(LAYERS)-1)
+                face_colors = np.array(
+                    [np.bincount(row, minlength=len(LAYERS)).argmax() for row in vv],
+                    dtype=float)
+                ax.tripcolor(masked_tri, facecolors=face_colors, cmap=cmap, norm=norm,
+                             shading="flat", alpha=0.85, rasterized=True)
+            else:
+                ax.tripcolor(masked_tri, values_fsa, cmap=cmap, norm=norm,
+                             shading="gouraud", alpha=0.85, rasterized=True)
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title("Linke Hemisphäre" if hemi == "lh" else "Rechte Hemisphäre",
@@ -124,9 +140,10 @@ def draw_hemi(ax, hemi, values_fsa, cmap, norm):
 
 def save_fig(title, cmap, norm, out_path, cbar_label,
              vals_lh, vals_rh, discrete_ticks=None):
+    discrete = discrete_ticks is not None
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
-    draw_hemi(axes[0], "lh", vals_lh, cmap, norm)
-    draw_hemi(axes[1], "rh", vals_rh, cmap, norm)
+    draw_hemi(axes[0], "lh", vals_lh, cmap, norm, discrete=discrete)
+    draw_hemi(axes[1], "rh", vals_rh, cmap, norm, discrete=discrete)
 
     sm = ScalarMappable(cmap=matplotlib.colormaps[cmap], norm=norm)
     sm.set_array([])
@@ -201,7 +218,7 @@ for h in ["lh", "rh"]:
     best_masked[h] = b
 save_fig(
     f"Beste RSA-Schicht je Vertex  ({subj}, {TAG})",
-    "viridis", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
+    "layers6", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
     FIG_DIR / f"fig_flatmap_rsa_bestlayer_{TAG}_{subj}.pdf",
     "Beste Schicht  (p < 0.05)",
     resample("lh", best_masked["lh"]),
@@ -255,7 +272,7 @@ for hdim in [0, 1]:
         tda_best[h] = b
     save_fig(
         f"Beste TDA-Schicht je Vertex (min Wasserstein $H_{hdim}$)  ({subj}, {TAG})",
-        "viridis", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
+        "layers6", BoundaryNorm(np.arange(-0.5, len(LAYERS)), len(LAYERS)),
         FIG_DIR / f"fig_flatmap_tda_bestlayer_H{hdim}_{TAG}_{subj}.pdf",
         f"Beste Schicht  (min Wasserstein $H_{hdim}$)",
         resample("lh", tda_best["lh"]),
